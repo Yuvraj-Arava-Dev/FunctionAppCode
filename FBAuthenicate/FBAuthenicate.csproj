@@ -14,5 +14,7 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.0.1" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.0.2" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <!-- Added for Event Hubs producer client -->
+    <PackageReference Include="Azure.Messaging.EventHubs" Version="5.11.2" />
   </ItemGroup>
 </Project>

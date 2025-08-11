@@ -17,6 +17,8 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using System.Xml;
+using Azure.Messaging.EventHubs;
+using Azure.Messaging.EventHubs.Producer;
 
 namespace FBAuthenticate.Controllers
 {
@@ -25,15 +27,17 @@ namespace FBAuthenticate.Controllers
         private readonly IMemoryCache _cache;
         private readonly IConfiguration _config;
         private readonly TimeSpan _expiry;
+        private readonly EventHubProducerClient _eventHubProducer;
 
         // replace HashSet in cache with a thread-safe collection to track keys
         // We still keep the "token-keys" cache entry for compatibility, but we maintain a thread-safe set here.
         private static readonly ConcurrentDictionary<string, byte> _tokenKeys = new ConcurrentDictionary<string, byte>();
 
-        public AuthController(IMemoryCache cache, IConfiguration config)
+        public AuthController(IMemoryCache cache, IConfiguration config, EventHubProducerClient eventHubProducer)
         {
             _cache = cache;
             _config = config;
+            _eventHubProducer = eventHubProducer;
 
             // Default to 24 hours if TokenExpiryHours is not specified
             double hours = config.GetValue<double>("TokenExpiryHours", 24);
@@ -108,7 +112,8 @@ namespace FBAuthenticate.Controllers
         }
 
         /// <summary>
-        /// Validates headers and request body, converts JSON to XML, sends lead data to the API.
+        /// Validates headers and request body, converts JSON to XML, sends lead data to the API with retry.
+        /// On failure/timeout after retries, writes the JSON request body to Event Hub.
         /// </summary>
         [Function("SubmitLead")]
         public async Task<HttpResponseData> SubmitLead(
@@ -154,11 +159,28 @@ namespace FBAuthenticate.Controllers
                 return await CreateJsonResponse(req, HttpStatusCode.Forbidden, new { Message = "Invalid or expired token." });
             }
 
-            string xmlRequestBody = ConvertJsonToXml(JsonConvert.SerializeObject(body));
+            // Prepare JSON and XML forms
+            string jsonRequestBody = JsonConvert.SerializeObject(body);
+            string xmlRequestBody = ConvertJsonToXml(jsonRequestBody);
             log.LogInformation("Converted lead request body to XML.");
 
-            string leadApiResponse = await LeadApiRequest(_config, xmlRequestBody);
-            log.LogInformation("Lead API response received.");
+            string leadApiResponse;
+            try
+            {
+                leadApiResponse = await LeadApiRequest(_config, xmlRequestBody);
+                log.LogInformation("Lead API response received.");
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Lead API failed after retries; writing payload to Event Hub.");
+                await SendToEventHubAsync(jsonRequestBody, log);
+
+                return await CreateJsonResponse(req, HttpStatusCode.Accepted, new
+                {
+                    message = "Lead queued for async processing via Event Hub.",
+                    queued = true
+                });
+            }
 
             return await CreateJsonResponse(req, HttpStatusCode.OK, new
             {
@@ -233,20 +255,77 @@ namespace FBAuthenticate.Controllers
             }
         }
 
-        // Note: still creates HttpClient per call to preserve original behavior.
-        // Recommended: inject IHttpClientFactory or reuse a singleton HttpClient.
+        // Note: now includes retry logic and throws on final failure.
         public static async Task<string> LeadApiRequest(IConfiguration config, string xmlData)
         {
-            using var client = new System.Net.Http.HttpClient();
+            int maxRetries = Math.Max(1, config.GetValue<int>("LeadApiMaxRetries", 3));
+            int baseDelayMs = Math.Max(100, config.GetValue<int>("LeadApiBaseDelayMs", 500));
+            int timeoutSeconds = Math.Max(5, config.GetValue<int>("LeadApiTimeoutSeconds", 30));
+
             var authValue = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{config["LeadApiUsername"]}:{config["LeadApiPassword"]}"));
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", authValue);
+            var requestUri = config["LeadApiUrl"];
 
-            var content = new System.Net.Http.StringContent(xmlData, Encoding.UTF8, "application/xml");
-            var response = await client.PostAsync(config["LeadApiUrl"], content);
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    using var client = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", authValue);
 
-            return response.IsSuccessStatusCode
-                ? await response.Content.ReadAsStringAsync()
-                : $"Error: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}";
+                    var content = new System.Net.Http.StringContent(xmlData, Encoding.UTF8, "application/xml");
+                    var response = await client.PostAsync(requestUri, content);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        return await response.Content.ReadAsStringAsync();
+                    }
+
+                    // Non-success considered failure
+                    if (attempt == maxRetries)
+                    {
+                        string responseBody = await response.Content.ReadAsStringAsync();
+                        throw new Exception($"Lead API failed with status {(int)response.StatusCode} {response.ReasonPhrase}: {responseBody}");
+                    }
+                }
+                catch (TaskCanceledException) when (attempt < maxRetries)
+                {
+                    // timeout or cancellation - retry
+                }
+                catch (System.Net.Http.HttpRequestException) when (attempt < maxRetries)
+                {
+                    // transient network failure - retry
+                }
+
+                // Exponential backoff with jitter
+                int delayMs = (int)(baseDelayMs * Math.Pow(2, attempt - 1));
+                int jitter = Random.Shared.Next(0, baseDelayMs);
+                await Task.Delay(delayMs + jitter);
+            }
+
+            throw new Exception("Lead API request failed after retries.");
+        }
+
+        private async Task SendToEventHubAsync(string jsonBody, ILogger log)
+        {
+            try
+            {
+                using EventDataBatch batch = await _eventHubProducer.CreateBatchAsync();
+                var eventData = new EventData(Encoding.UTF8.GetBytes(jsonBody));
+
+                if (!batch.TryAdd(eventData))
+                {
+                    // Payload too large for batch; send as a single event
+                    await _eventHubProducer.SendAsync(new[] { eventData });
+                    return;
+                }
+
+                await _eventHubProducer.SendAsync(batch);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Failed to write to Event Hub.");
+                throw;
+            }
         }
 
         private static async Task<T?> ParseRequest<T>(HttpRequestData req, ILogger log, string errorMessage)
