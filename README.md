@@ -31,7 +31,7 @@ Azure Functions application for Facebook lead authentication and submission with
 
 ### Databricks Retry Mode
 - **Authentication**: Skipped entirely
-- **Identification**: Via header `X-Retry-Job: true` (configurable)
+- **Identification**: Via query parameter `retryJob=true` (configurable)
 - **Response Handling**: Returns appropriate status codes:
   - `status: "success"` (200) - API call succeeded
   - `status: "empty"` (200) - API call succeeded but returned empty response
@@ -46,7 +46,7 @@ Add these to your Azure Function App Settings or local.settings.json:
 ```json
 {
   "TokenExpiryHours": 24,
-  "RetryJobHeaderName": "X-Retry-Job",
+  "RetryJobParamName": "retryJob",
   "LeadApiMaxRetries": 3,
   "LeadApiBaseDelayMs": 500,
   "LeadApiTimeoutSeconds": 30,
@@ -60,14 +60,13 @@ Add these to your Azure Function App Settings or local.settings.json:
 
 ## Databricks Integration
 
-When calling from Databricks retry jobs, include the retry header:
+When calling from Databricks retry jobs, include the retry query parameter:
 
 ```python
 import requests
 
 # Example Databricks retry call
 headers = {
-    "X-Retry-Job": "true",  # This skips authentication
     "Content-Type": "application/json"
 }
 
@@ -80,8 +79,9 @@ payload = {
     "Val": "lead-data-here"
 }
 
+# Add retryJob=true query parameter to skip authentication
 response = requests.post(
-    "https://your-function-app.azurewebsites.net/api/SubmitLead",
+    "https://your-function-app.azurewebsites.net/api/SubmitLead?retryJob=true",
     headers=headers,
     json=payload
 )
@@ -103,9 +103,9 @@ Client → FBAutenticate (get token) → SubmitLead (with auth) → Lead API
                                                          Event Hub
 
 Databricks Retry Flow:
-Event Hub → Databricks → SubmitLead (X-Retry-Job: true) → Lead API
-                                                         ↓ (success: 200, failure: 500)
-                                                    Return Status (no Event Hub)
+Event Hub → Databricks → SubmitLead (?retryJob=true) → Lead API
+                                                      ↓ (success: 200, failure: 500)
+                                                 Return Status (no Event Hub)
 ```
 
 ## Response Handling

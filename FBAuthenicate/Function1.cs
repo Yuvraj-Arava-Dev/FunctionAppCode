@@ -17,28 +17,12 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using System.Xml;
+using System.Web;
 using Azure.Messaging.EventHubs;
 using Azure.Messaging.EventHubs.Producer;
 
 namespace FBAuthenticate.Controllers
 {
-    /// <summary>
-    /// Azure Functions controller for Facebook lead authentication and submission.
-    /// 
-    /// Supports two modes of operation:
-    /// 1. Regular requests: Require authentication via AuthorizationToken/AuthorizationId headers.
-    ///    On API failure after retries, writes payload to Event Hub for async processing.
-    /// 
-    /// 2. Databricks retry jobs: Identified by configurable header (default: "X-Retry-Job: true").
-    ///    - Skips authentication validation entirely
-    ///    - On API failure, returns error without writing to Event Hub (prevents infinite loops)
-    ///    - Intended for processing failed leads from Event Hub via Databricks
-    /// 
-    /// Configuration options:
-    /// - RetryJobHeaderName: Header name to identify retry jobs (default: "X-Retry-Job")
-    /// - TokenExpiryHours: Token cache expiry time (default: 24 hours)
-    /// - LeadApiMaxRetries, LeadApiBaseDelayMs, LeadApiTimeoutSeconds: API retry settings
-    /// </summary>
     public class AuthController
     {
         private readonly IMemoryCache _cache;
@@ -46,8 +30,6 @@ namespace FBAuthenticate.Controllers
         private readonly TimeSpan _expiry;
         private readonly EventHubProducerClient _eventHubProducer;
 
-        // replace HashSet in cache with a thread-safe collection to track keys
-        // We still keep the "token-keys" cache entry for compatibility, but we maintain a thread-safe set here.
         private static readonly ConcurrentDictionary<string, byte> _tokenKeys = new ConcurrentDictionary<string, byte>();
 
         public AuthController(IMemoryCache cache, IConfiguration config, EventHubProducerClient eventHubProducer)
@@ -127,12 +109,6 @@ namespace FBAuthenticate.Controllers
             log.LogInformation("Returning {Count} token(s).", result.Count);
             return await CreateJsonResponse(req, HttpStatusCode.OK, result);
         }
-
-        /// <summary>
-        /// Validates headers and request body, converts JSON to XML, sends lead data to the API with retry.
-        /// On failure/timeout after retries, writes the JSON request body to Event Hub.
-        /// For Databricks retry jobs, authentication is skipped and Event Hub writes are prevented on failure.
-        /// </summary>
         [Function("SubmitLead")]
         public async Task<HttpResponseData> SubmitLead(
             [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
@@ -141,15 +117,19 @@ namespace FBAuthenticate.Controllers
             var log = context.GetLogger<AuthController>();
             log.LogInformation("SubmitLead triggered.");
 
-            // Check if this is a retry job from Databricks
-            // Use configurable header name (defaults to "X-Retry-Job")
-            string retryJobHeaderName = _config.GetValue<string>("RetryJobHeaderName", "X-Retry-Job");
-            bool isDatabricksRetry = req.Headers.TryGetValues(retryJobHeaderName, out var retryValues) && 
-                                   retryValues.FirstOrDefault()?.ToLowerInvariant() == "true";
+            // Check if this is a retry job from Databricks using query parameter
+            // Use configurable query parameter name (defaults to "retryJob")
+            string retryJobParamName = _config.GetValue<string>("RetryJobParamName", "retryJob");
+            
+            // Parse query parameters
+            var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
+            string? retryJobValue = query[retryJobParamName];
+            bool isDatabricksRetry = !string.IsNullOrEmpty(retryJobValue) && 
+                                   retryJobValue.ToLowerInvariant() == "true";
 
             if (isDatabricksRetry)
             {
-                log.LogInformation("Detected Databricks retry job (header: {HeaderName}) - skipping authentication and Event Hub fallback.", retryJobHeaderName);
+                log.LogInformation("Detected Databricks retry job (query param: {ParamName}={ParamValue}) - skipping authentication and Event Hub fallback.", retryJobParamName, retryJobValue);
             }
 
             // Skip authentication for Databricks retry jobs
