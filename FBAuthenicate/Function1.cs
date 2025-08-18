@@ -184,11 +184,7 @@ namespace FBAuthenticate.Controllers
 
             return await CreateJsonResponse(req, HttpStatusCode.OK, new
             {
-                message = "Lead processed successfully",
-                headers = authHeaders,
-                body,
-                xmlRequestBody,
-                leadApiResponse
+                message = "Lead processed successfully"
             });
         }
 
@@ -309,8 +305,21 @@ namespace FBAuthenticate.Controllers
         {
             try
             {
+                // Deserialize incoming JSON into a dynamic object
+                var leadData = JsonConvert.DeserializeObject<dynamic>(jsonBody);
+
+                // Wrap with RequestId
+                var eventPayload = new
+                {
+                    LeadData = leadData,
+                    RequestId = Guid.NewGuid().ToString()
+                };
+
+                // Serialize to JSON string
+                string finalJson = JsonConvert.SerializeObject(eventPayload);
+
                 using EventDataBatch batch = await _eventHubProducer.CreateBatchAsync();
-                var eventData = new EventData(Encoding.UTF8.GetBytes(jsonBody));
+                var eventData = new EventData(Encoding.UTF8.GetBytes(finalJson));
 
                 if (!batch.TryAdd(eventData))
                 {
