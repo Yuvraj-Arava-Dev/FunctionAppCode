@@ -275,6 +275,40 @@ namespace FBAuthenticate.Controllers
 
                 return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
             }
+            // Handle HTTP request exceptions specifically
+            catch (System.Net.Http.HttpRequestException httpEx)
+            {
+                log.LogError(httpEx, "HTTP request error during Lead API call.");
+                leadApiResponse = string.Empty;
+                apiException = httpEx;
+
+                if (isDatabricksRetry)
+                {
+                    // 525 Retry Failure - HTTP request case
+                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
+                    {
+                        message = "Retry Failure due to HTTP request issue",
+                        error = httpEx.Message,
+                        isRetryJob = true
+                    });
+                }
+
+                // For UI requests, write to Event Hub and return success
+                try
+                {
+                    await SendToEventHubAsync(jsonRequestBody, log);
+                }
+                catch (Exception eventHubEx)
+                {
+                    log.LogError(eventHubEx, "Failed to write to Event Hub after HTTP request error.");
+                    return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
+                    {
+                        message = "Unknown error from API"
+                    });
+                }
+
+                return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
+            }
             catch (Exception ex)
             {
                 leadApiResponse = string.Empty;
@@ -430,26 +464,26 @@ namespace FBAuthenticate.Controllers
                     lastStatusCode = response.StatusCode;
                     lastResponseBody = await response.Content.ReadAsStringAsync();
 
-                    if (response.IsSuccessStatusCode)
+                    if (response.StatusCode == HttpStatusCode.Continue) // Status code 100
                     {
                         return (lastResponseBody, lastStatusCode);
                     }
 
-                    // Non-success considered failure - continue to retry logic
+                    // Status code is not 100 - continue to retry logic
                     if (attempt == maxRetries)
                     {
                         throw new Exception($"Lead API failed with status {(int)response.StatusCode} {response.ReasonPhrase}: {lastResponseBody}");
                     }
                 }
-                catch (TaskCanceledException) when (attempt < maxRetries)
+                catch (TaskCanceledException)
                 {
-                    // timeout or cancellation - retry
-                    lastStatusCode = HttpStatusCode.RequestTimeout;
+                    // timeout or cancellation - don't retry, let caller handle immediately
+                    throw;
                 }
-                catch (System.Net.Http.HttpRequestException) when (attempt < maxRetries)
+                catch (System.Net.Http.HttpRequestException)
                 {
-                    // transient network failure - retry
-                    lastStatusCode = HttpStatusCode.ServiceUnavailable;
+                    // network failure - don't retry, let caller handle immediately
+                    throw;
                 }
 
                 // Exponential backoff with jitter
