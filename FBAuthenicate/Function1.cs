@@ -177,13 +177,20 @@ namespace FBAuthenticate.Controllers
                 }
             }
 
-            LeadRequest? body = await ParseRequest<LeadRequest>(req, log, "Invalid JSON body");
+            // Parse the request body
+            dynamic? body = await ParseRequest<dynamic>(req, log, "Invalid lead request JSON");
+
             if (isDatabricksRetry && body != null)
             {
                 log.LogInformation("Databricks retry job detected – removing Id from lead request.");
                 body.Id = null;
             }
-            if (body == null || string.IsNullOrEmpty(body.Val) || (!isDatabricksRetry && body.Id == null))
+            
+            // Validate required fields
+            bool hasVal = body != null && !string.IsNullOrEmpty(body.Val?.ToString());
+            bool hasId = body != null && body.Id != null;
+            
+            if (body == null || !hasVal || (!isDatabricksRetry && !hasId))
             {
                 log.LogWarning("Invalid lead request body: missing required fields.");
                 return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "Body is missing required fields" });
@@ -194,183 +201,80 @@ namespace FBAuthenticate.Controllers
             string xmlRequestBody = ConvertJsonToXml(jsonRequestBody);
             log.LogInformation("Converted lead request body to XML.");
 
-            string leadApiResponse;
-            bool apiSucceeded = false;
-            Exception? apiException = null;
-            HttpStatusCode? apiStatusCode = null;
+            // Implement pseudo code logic
+            bool isSuccess = false;
+            string deliver_response_msg_and_status_code = "";
+            string leadApiResponse = "";
+            HttpStatusCode apiStatusCode = HttpStatusCode.InternalServerError;
 
             try
             {
+                // Call API
                 var apiResult = await LeadApiRequest(_config, xmlRequestBody);
                 leadApiResponse = apiResult.Response;
                 apiStatusCode = apiResult.StatusCode;
-                apiSucceeded = true;
+                
+                isSuccess = true;
+                deliver_response_msg_and_status_code = "";
                 log.LogInformation("Lead API response received with status code: {StatusCode}", apiStatusCode);
-            }
-            // Handle timeout specifically
-            catch (TaskCanceledException tex)
-            {
-                log.LogError(tex, "Timeout occurred during Lead API call.");
-                leadApiResponse = string.Empty;
-                apiException = tex;
 
-                if (isDatabricksRetry)
+                // If status code != 100
+                if (apiStatusCode != HttpStatusCode.Continue) // Status code 100
                 {
-                    // 525 Retry Failure - Timeout case
-                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
-                    {
-                        message = "Retry Failure due to timeout",
-                        error = tex.Message,
-                        isRetryJob = true
-                    });
+                    isSuccess = false;
+                    deliver_response_msg_and_status_code = $"Status code: {(int)apiStatusCode}, Response: {leadApiResponse}";
+                    log.LogWarning("Lead API returned non-success status code: {StatusCode}", apiStatusCode);
                 }
-
-                // For UI requests, write to Event Hub and return success
-                try
-                {
-                    await SendToEventHubAsync(jsonRequestBody, log);
-                }
-                catch (Exception eventHubEx)
-                {
-                    log.LogError(eventHubEx, "Failed to write to Event Hub after timeout.");
-                    return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
-                    {
-                        message = "Unknown error from API"
-                    });
-                }
-
-                return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
-            }
-            // Handle socket/network exceptions specifically
-            catch (SocketException sockex)
-            {
-                log.LogError(sockex, "Socket error during Lead API call.");
-                leadApiResponse = string.Empty;
-                apiException = sockex;
-
-                if (isDatabricksRetry)
-                {
-                    // 525 Retry Failure - Network/socket case
-                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
-                    {
-                        message = "Retry Failure due to network issue",
-                        error = sockex.Message,
-                        isRetryJob = true
-                    });
-                }
-
-                // For UI requests, write to Event Hub and return success
-                try
-                {
-                    await SendToEventHubAsync(jsonRequestBody, log);
-                }
-                catch (Exception eventHubEx)
-                {
-                    log.LogError(eventHubEx, "Failed to write to Event Hub after socket error.");
-                    return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
-                    {
-                        message = "Unknown error from API"
-                    });
-                }
-
-                return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
-            }
-            // Handle HTTP request exceptions specifically
-            catch (System.Net.Http.HttpRequestException httpEx)
-            {
-                log.LogError(httpEx, "HTTP request error during Lead API call.");
-                leadApiResponse = string.Empty;
-                apiException = httpEx;
-
-                if (isDatabricksRetry)
-                {
-                    // 525 Retry Failure - HTTP request case
-                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
-                    {
-                        message = "Retry Failure due to HTTP request issue",
-                        error = httpEx.Message,
-                        isRetryJob = true
-                    });
-                }
-
-                // For UI requests, write to Event Hub and return success
-                try
-                {
-                    await SendToEventHubAsync(jsonRequestBody, log);
-                }
-                catch (Exception eventHubEx)
-                {
-                    log.LogError(eventHubEx, "Failed to write to Event Hub after HTTP request error.");
-                    return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
-                    {
-                        message = "Unknown error from API"
-                    });
-                }
-
-                return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
             }
             catch (Exception ex)
             {
-                leadApiResponse = string.Empty;
-                apiException = ex;
+                isSuccess = false;
+                deliver_response_msg_and_status_code = ex.Message;
+                log.LogError(ex, "Exception occurred during Lead API call: {Message}", ex.Message);
+            }
 
-                if (isDatabricksRetry)
+            // Handle response based on success status
+            if (isSuccess)
+            {
+                // Respond to API call - 200 - lead received
+                return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
+            }
+            else
+            {
+                // Call failed
+                if (!isDatabricksRetry)
                 {
-                    // 525 Retry Failure - For Databricks retry jobs, return failure status with detailed info
-                    log.LogError(ex, "Lead API failed for Databricks retry job - returning 525 status.");
-                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
-                    {
-                        message = "Retry Failure with Deliver response status code and response message",
-                        error = ex.Message,
-                        isRetryJob = true
-                    });
-                }
-                else
-                {
-                    // For UI requests, write to Event Hub but still return 200 with "Lead received"
-                    log.LogError(ex, "Lead API failed after retries; writing payload to Event Hub but returning success to UI.");
-
+                    // Call not from retry job
+                    // Add request id and send payload to event hub
                     try
                     {
                         await SendToEventHubAsync(jsonRequestBody, log);
+                        log.LogInformation("Payload sent to Event Hub after API failure.");
+                        
+                        // Respond to user as 200 - lead received
+                        return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
                     }
                     catch (Exception eventHubEx)
                     {
                         log.LogError(eventHubEx, "Failed to write to Event Hub after API failure.");
-                        // 500 Internal Server Error - Unknown error from API and Event Hub failure
                         return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
                         {
                             message = "Unknown error from API"
                         });
                     }
-
-                    // 200 Success - Lead received (even though API failed, Event Hub succeeded)
-                    return await CreateJsonResponse(req, HttpStatusCode.OK, new
+                }
+                else
+                {
+                    // Call from retry job
+                    // Respond with 525 + deliver_response_msg_and_status_code (this has to go to retry table in databricks)
+                    log.LogWarning("Databricks retry job failed - returning 525 with details: {Details}", deliver_response_msg_and_status_code);
+                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
                     {
-                        message = "Lead received"
+                        message = "Retry Failure",
+                        error = deliver_response_msg_and_status_code,
+                        isRetryJob = true
                     });
                 }
-            }
-
-            // Handle successful API responses
-            if (isDatabricksRetry)
-            {
-                // For retry jobs, provide detailed response with status code info
-                return await CreateJsonResponse(req, HttpStatusCode.OK, new
-                {
-                    message = "Lead received",
-                    isRetryJob = true,
-                    apiStatusCode = (int?)apiStatusCode,
-                    response = leadApiResponse
-                });
-            }
-            else
-            {
-                // 200 Success - Lead received (for UI requests, always return simple success message)
-                return await CreateJsonResponse(req, HttpStatusCode.OK, new
-                {
-                    message = "Lead received"
-                });
             }
         }
 
@@ -472,7 +376,9 @@ namespace FBAuthenticate.Controllers
                     // Status code is not 100 - continue to retry logic
                     if (attempt == maxRetries)
                     {
-                        throw new Exception($"Lead API failed with status {(int)response.StatusCode} {response.ReasonPhrase}: {lastResponseBody}");
+                        // Return the response and status code instead of throwing exception
+                        // Let the calling function decide what to do with non-100 status codes
+                        return (lastResponseBody, lastStatusCode);
                     }
                 }
                 catch (TaskCanceledException)
@@ -492,7 +398,9 @@ namespace FBAuthenticate.Controllers
                 await Task.Delay(delayMs + jitter);
             }
 
-            throw new Exception($"Lead API request failed after {maxRetries} retries. Last status: {(int)lastStatusCode}. Last response: {lastResponseBody}");
+            // Return the last response and status code instead of throwing exception
+            // This handles the case where all retries failed due to non-100 status codes
+            return (lastResponseBody, lastStatusCode);
         }
 
         private async Task SendToEventHubAsync(string jsonBody, ILogger log)
@@ -556,6 +464,4 @@ namespace FBAuthenticate.Controllers
 
     public class AuthRequest { public string? ip { get; set; } public string? timestamp { get; set; } }
     public class AuthHeaders { public string? AuthorizationToken { get; set; } public string? AuthorizationId { get; set; } }
-    public class LeadRequest { public LeadId? Id { get; set; } public string? Val { get; set; } }
-    public class LeadId { public string? Sequence { get; set; } public string? Source { get; set; } public string? Name { get; set; } }
 }
