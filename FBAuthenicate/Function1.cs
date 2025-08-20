@@ -1,4 +1,6 @@
 ﻿using Azure.Core;
+using Azure.Messaging.EventHubs;
+using Azure.Messaging.EventHubs.Producer;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
@@ -13,13 +15,12 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
-using System.Xml;
 using System.Web;
-using Azure.Messaging.EventHubs;
-using Azure.Messaging.EventHubs.Producer;
+using System.Xml;
 
 namespace FBAuthenticate.Controllers
 {
@@ -47,41 +48,51 @@ namespace FBAuthenticate.Controllers
         /// Generates a token for the given IP and timestamp, caches it, and returns it to the client.
         /// Note: In the Azure Functions Isolated Worker model we use FunctionContext to get a logger.
         /// </summary>
-        [Function("FBAutenticate")]
-        public async Task<HttpResponseData> FBAutenticate(
-            [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
-            FunctionContext context)
+        [Function("authenticateFBSubmitLead")]
+        public async Task<HttpResponseData> authenticateFBSubmitLead(
+    [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
+    FunctionContext context)
         {
             var log = context.GetLogger<AuthController>();
             log.LogInformation("FBAutenticate triggered.");
 
             AuthRequest? request = await ParseRequest<AuthRequest>(req, log, "Invalid JSON");
-            if (request == null || string.IsNullOrEmpty(request.ip) || string.IsNullOrEmpty(request.timestamp))
+
+            if (request == null)
             {
-                log.LogWarning("Invalid request: missing ip or timestamp.");
-                return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "IP and timestamp required" });
+                log.LogWarning("Failed to parse request JSON.");
+                return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "Invalid JSON" });
             }
 
-            string tokenCacheKey = $"fbt-{request.ip}-token";
+            // Trim only IP address
+            var ip = request.ip?.Trim();
+            var timestamp = request.timestamp;
+
+            if (string.IsNullOrEmpty(ip) || string.IsNullOrEmpty(timestamp))
+            {
+                log.LogWarning("Missing IP or timestamp in request.");
+                return await CreateJsonResponse(req, (HttpStatusCode)417, new { message = "IP and timestamp required" });
+            }
+
+            string tokenCacheKey = $"fbsl-{ip}-token";
             log.LogInformation("Token cache key computed: {TokenCacheKey}", tokenCacheKey);
 
             if (!_cache.TryGetValue(tokenCacheKey, out string token))
             {
-                token = GenerateToken(request.ip, request.timestamp);
+                token = GenerateToken(ip, timestamp);
                 _cache.Set(tokenCacheKey, token, _expiry);
 
-                // Track the key in a thread-safe manner
-                _tokenKeys.TryAdd(tokenCacheKey, 0);
-
-                log.LogInformation("Generated and cached new token for IP {IP}.", request.ip);
+                log.LogInformation("Generated and cached new token for IP {IP}.", ip);
             }
             else
             {
-                log.LogInformation("Token retrieved from cache for IP {IP}.", request.ip);
+                log.LogInformation("Token retrieved from cache for IP {IP}.", ip);
             }
 
             return await CreateJsonResponse(req, HttpStatusCode.OK, new { token });
         }
+
+
 
         /// <summary>
         /// Lists all active tokens from the in-memory cache.
@@ -109,22 +120,22 @@ namespace FBAuthenticate.Controllers
             log.LogInformation("Returning {Count} token(s).", result.Count);
             return await CreateJsonResponse(req, HttpStatusCode.OK, result);
         }
-        [Function("SubmitLead")]
-        public async Task<HttpResponseData> SubmitLead(
+        [Function("fbSubmitLead")]
+        public async Task<HttpResponseData> fbSubmitLead(
             [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
             FunctionContext context)
         {
             var log = context.GetLogger<AuthController>();
-            log.LogInformation("SubmitLead triggered.");
+            log.LogInformation("fbSubmitLead triggered.");
 
             // Check if this is a retry job from Databricks using query parameter
             // Use configurable query parameter name (defaults to "retryJob")
             string retryJobParamName = _config.GetValue<string>("RetryJobParamName", "retryJob");
-            
+
             // Parse query parameters
             var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
             string? retryJobValue = query[retryJobParamName];
-            bool isDatabricksRetry = !string.IsNullOrEmpty(retryJobValue) && 
+            bool isDatabricksRetry = !string.IsNullOrEmpty(retryJobValue) &&
                                    retryJobValue.ToLowerInvariant() == "true";
 
             if (isDatabricksRetry)
@@ -132,7 +143,6 @@ namespace FBAuthenticate.Controllers
                 log.LogInformation("Detected Databricks retry job (query param: {ParamName}={ParamValue}) - skipping authentication and Event Hub fallback.", retryJobParamName, retryJobValue);
             }
 
-            // Skip authentication for Databricks retry jobs
             if (!isDatabricksRetry)
             {
                 var authHeaders = new AuthHeaders
@@ -141,32 +151,39 @@ namespace FBAuthenticate.Controllers
                     AuthorizationId = req.Headers.TryGetValues("AuthorizationId", out var idValues) ? idValues.FirstOrDefault() : null
                 };
 
+                // 417 Expectation Failed - When header values are empty
                 if (string.IsNullOrEmpty(authHeaders.AuthorizationToken) || string.IsNullOrEmpty(authHeaders.AuthorizationId))
                 {
                     log.LogWarning("Missing Authorization headers.");
-                    return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "Missing Authorization headers" });
+                    return await CreateJsonResponse(req, (HttpStatusCode)417, new { message = "Expected header values are missing" });
                 }
 
-                // Decrypt header; handle failure explicitly (return 400/403)
+                // Decrypt header; handle failure explicitly
                 string? ipAddress = DecryptHeaderValue(authHeaders.AuthorizationId, log);
                 if (string.IsNullOrEmpty(ipAddress))
                 {
                     log.LogWarning("Failed to decrypt AuthorizationId header.");
-                    return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "Invalid AuthorizationId header." });
+                    return await CreateJsonResponse(req, (HttpStatusCode)401, new { message = "Access Denied" });
                 }
 
-                string tokenCacheKey = $"fbt-{ipAddress}-token";
+                string tokenCacheKey = $"fbsl-{ipAddress.Trim()}-token";
                 log.LogInformation("Decrypted IP: {IP}. Checking token with key {Key}", ipAddress, tokenCacheKey);
 
+                // 401 Access Denied - Invalid or expired token
                 if (!_cache.TryGetValue(tokenCacheKey, out string cachedToken) || cachedToken != authHeaders.AuthorizationToken)
                 {
                     log.LogWarning("Token validation failed for IP: {IP}", ipAddress);
-                    return await CreateJsonResponse(req, HttpStatusCode.Forbidden, new { Message = "Invalid or expired token." });
+                    return await CreateJsonResponse(req, (HttpStatusCode)401, new { message = "Access Denied" });
                 }
             }
 
             LeadRequest? body = await ParseRequest<LeadRequest>(req, log, "Invalid JSON body");
-            if (body == null || body.Id == null || string.IsNullOrEmpty(body.Val))
+            if (isDatabricksRetry && body != null)
+            {
+                log.LogInformation("Databricks retry job detected – removing Id from lead request.");
+                body.Id = null;
+            }
+            if (body == null || string.IsNullOrEmpty(body.Val) || (!isDatabricksRetry && body.Id == null))
             {
                 log.LogWarning("Invalid lead request body: missing required fields.");
                 return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "Body is missing required fields" });
@@ -180,36 +197,120 @@ namespace FBAuthenticate.Controllers
             string leadApiResponse;
             bool apiSucceeded = false;
             Exception? apiException = null;
+            HttpStatusCode? apiStatusCode = null;
 
             try
             {
-                leadApiResponse = await LeadApiRequest(_config, xmlRequestBody);
+                var apiResult = await LeadApiRequest(_config, xmlRequestBody);
+                leadApiResponse = apiResult.Response;
+                apiStatusCode = apiResult.StatusCode;
                 apiSucceeded = true;
-                log.LogInformation("Lead API response received.");
+                log.LogInformation("Lead API response received with status code: {StatusCode}", apiStatusCode);
+            }
+            // Handle timeout specifically
+            catch (TaskCanceledException tex)
+            {
+                log.LogError(tex, "Timeout occurred during Lead API call.");
+                leadApiResponse = string.Empty;
+                apiException = tex;
+
+                if (isDatabricksRetry)
+                {
+                    // 525 Retry Failure - Timeout case
+                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
+                    {
+                        message = "Retry Failure due to timeout",
+                        error = tex.Message,
+                        isRetryJob = true
+                    });
+                }
+
+                // For UI requests, write to Event Hub and return success
+                try
+                {
+                    await SendToEventHubAsync(jsonRequestBody, log);
+                }
+                catch (Exception eventHubEx)
+                {
+                    log.LogError(eventHubEx, "Failed to write to Event Hub after timeout.");
+                    return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
+                    {
+                        message = "Unknown error from API"
+                    });
+                }
+
+                return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
+            }
+            // Handle socket/network exceptions specifically
+            catch (SocketException sockex)
+            {
+                log.LogError(sockex, "Socket error during Lead API call.");
+                leadApiResponse = string.Empty;
+                apiException = sockex;
+
+                if (isDatabricksRetry)
+                {
+                    // 525 Retry Failure - Network/socket case
+                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
+                    {
+                        message = "Retry Failure due to network issue",
+                        error = sockex.Message,
+                        isRetryJob = true
+                    });
+                }
+
+                // For UI requests, write to Event Hub and return success
+                try
+                {
+                    await SendToEventHubAsync(jsonRequestBody, log);
+                }
+                catch (Exception eventHubEx)
+                {
+                    log.LogError(eventHubEx, "Failed to write to Event Hub after socket error.");
+                    return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
+                    {
+                        message = "Unknown error from API"
+                    });
+                }
+
+                return await CreateJsonResponse(req, HttpStatusCode.OK, new { message = "Lead received" });
             }
             catch (Exception ex)
             {
                 leadApiResponse = string.Empty;
                 apiException = ex;
-                
+
                 if (isDatabricksRetry)
                 {
-                    // For Databricks retry jobs, return failure status without writing to Event Hub
-                    log.LogError(ex, "Lead API failed for Databricks retry job - returning failure status.");
-                    return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
+                    // 525 Retry Failure - For Databricks retry jobs, return failure status with detailed info
+                    log.LogError(ex, "Lead API failed for Databricks retry job - returning 525 status.");
+                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
                     {
-                        status = "failure",
-                        message = "Lead API failed for retry job",
+                        message = "Retry Failure with Deliver response status code and response message",
                         error = ex.Message,
                         isRetryJob = true
                     });
                 }
                 else
                 {
-                    // For UI requests, write to Event Hub but still return 200 with "lead received"
+                    // For UI requests, write to Event Hub but still return 200 with "Lead received"
                     log.LogError(ex, "Lead API failed after retries; writing payload to Event Hub but returning success to UI.");
-                    await SendToEventHubAsync(jsonRequestBody, log);
 
+                    try
+                    {
+                        await SendToEventHubAsync(jsonRequestBody, log);
+                    }
+                    catch (Exception eventHubEx)
+                    {
+                        log.LogError(eventHubEx, "Failed to write to Event Hub after API failure.");
+                        // 500 Internal Server Error - Unknown error from API and Event Hub failure
+                        return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
+                        {
+                            message = "Unknown error from API"
+                        });
+                    }
+
+                    // 200 Success - Lead received (even though API failed, Event Hub succeeded)
                     return await CreateJsonResponse(req, HttpStatusCode.OK, new
                     {
                         message = "Lead received"
@@ -220,26 +321,25 @@ namespace FBAuthenticate.Controllers
             // Handle successful API responses
             if (isDatabricksRetry)
             {
-                // Determine status based on API response content
-                string status = string.IsNullOrWhiteSpace(leadApiResponse) ? "empty" : "success";
-                
+                // For retry jobs, provide detailed response with status code info
                 return await CreateJsonResponse(req, HttpStatusCode.OK, new
                 {
-                    status = status,
-                    message = status == "empty" ? "Lead processed but API returned empty response" : "Lead processed successfully",
+                    message = "Lead received",
                     isRetryJob = true,
+                    apiStatusCode = (int?)apiStatusCode,
                     response = leadApiResponse
                 });
             }
             else
             {
-                // For UI requests, always return simple success message
+                // 200 Success - Lead received (for UI requests, always return simple success message)
                 return await CreateJsonResponse(req, HttpStatusCode.OK, new
                 {
                     message = "Lead received"
                 });
             }
         }
+
 
         private string GenerateToken(string ip, string timestamp)
         {
@@ -304,8 +404,8 @@ namespace FBAuthenticate.Controllers
             }
         }
 
-        // Note: now includes retry logic and throws on final failure.
-        public static async Task<string> LeadApiRequest(IConfiguration config, string xmlData)
+        // Updated to return both response and status code
+        public static async Task<(string Response, HttpStatusCode StatusCode)> LeadApiRequest(IConfiguration config, string xmlData)
         {
             int maxRetries = Math.Max(1, config.GetValue<int>("LeadApiMaxRetries", 3));
             int baseDelayMs = Math.Max(100, config.GetValue<int>("LeadApiBaseDelayMs", 500));
@@ -313,6 +413,9 @@ namespace FBAuthenticate.Controllers
 
             var authValue = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{config["LeadApiUsername"]}:{config["LeadApiPassword"]}"));
             var requestUri = config["LeadApiUrl"];
+
+            HttpStatusCode lastStatusCode = HttpStatusCode.InternalServerError;
+            string lastResponseBody = string.Empty;
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
@@ -324,25 +427,29 @@ namespace FBAuthenticate.Controllers
                     var content = new System.Net.Http.StringContent(xmlData, Encoding.UTF8, "application/xml");
                     var response = await client.PostAsync(requestUri, content);
 
+                    lastStatusCode = response.StatusCode;
+                    lastResponseBody = await response.Content.ReadAsStringAsync();
+
                     if (response.IsSuccessStatusCode)
                     {
-                        return await response.Content.ReadAsStringAsync();
+                        return (lastResponseBody, lastStatusCode);
                     }
 
-                    // Non-success considered failure
+                    // Non-success considered failure - continue to retry logic
                     if (attempt == maxRetries)
                     {
-                        string responseBody = await response.Content.ReadAsStringAsync();
-                        throw new Exception($"Lead API failed with status {(int)response.StatusCode} {response.ReasonPhrase}: {responseBody}");
+                        throw new Exception($"Lead API failed with status {(int)response.StatusCode} {response.ReasonPhrase}: {lastResponseBody}");
                     }
                 }
                 catch (TaskCanceledException) when (attempt < maxRetries)
                 {
                     // timeout or cancellation - retry
+                    lastStatusCode = HttpStatusCode.RequestTimeout;
                 }
                 catch (System.Net.Http.HttpRequestException) when (attempt < maxRetries)
                 {
                     // transient network failure - retry
+                    lastStatusCode = HttpStatusCode.ServiceUnavailable;
                 }
 
                 // Exponential backoff with jitter
@@ -351,7 +458,7 @@ namespace FBAuthenticate.Controllers
                 await Task.Delay(delayMs + jitter);
             }
 
-            throw new Exception("Lead API request failed after retries.");
+            throw new Exception($"Lead API request failed after {maxRetries} retries. Last status: {(int)lastStatusCode}. Last response: {lastResponseBody}");
         }
 
         private async Task SendToEventHubAsync(string jsonBody, ILogger log)
