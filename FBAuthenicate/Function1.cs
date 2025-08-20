@@ -97,29 +97,29 @@ namespace FBAuthenticate.Controllers
         /// <summary>
         /// Lists all active tokens from the in-memory cache.
         /// </summary>
-        [Function("ListTokens")]
-        public async Task<HttpResponseData> ListTokens(
-            [HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequestData req,
-            FunctionContext context)
-        {
-            var log = context.GetLogger<AuthController>();
-            log.LogInformation("ListTokens triggered.");
+        //[Function("ListTokens")]
+        //public async Task<HttpResponseData> ListTokens(
+        //    [HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequestData req,
+        //    FunctionContext context)
+        //{
+        //    var log = context.GetLogger<AuthController>();
+        //    log.LogInformation("ListTokens triggered.");
 
-            var result = new Dictionary<string, string>();
+        //    var result = new Dictionary<string, string>();
 
-            // Use the thread-safe key tracker to enumerate keys and read cached tokens
-            foreach (var kv in _tokenKeys)
-            {
-                var key = kv.Key;
-                if (_cache.TryGetValue(key, out string token))
-                {
-                    result[key] = token;
-                }
-            }
+        //    // Use the thread-safe key tracker to enumerate keys and read cached tokens
+        //    foreach (var kv in _tokenKeys)
+        //    {
+        //        var key = kv.Key;
+        //        if (_cache.TryGetValue(key, out string token))
+        //        {
+        //            result[key] = token;
+        //        }
+        //    }
 
-            log.LogInformation("Returning {Count} token(s).", result.Count);
-            return await CreateJsonResponse(req, HttpStatusCode.OK, result);
-        }
+        //    log.LogInformation("Returning {Count} token(s).", result.Count);
+        //    return await CreateJsonResponse(req, HttpStatusCode.OK, result);
+        //}
         [Function("fbSubmitLead")]
         public async Task<HttpResponseData> fbSubmitLead(
             [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
