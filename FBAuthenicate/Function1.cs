@@ -187,10 +187,7 @@ namespace FBAuthenticate.Controllers
             }
             
             // Validate required fields
-            bool hasVal = body != null && !string.IsNullOrEmpty(body.Val?.ToString());
-            bool hasId = body != null && body.Id != null;
-            
-            if (body == null || !hasVal || (!isDatabricksRetry && !hasId))
+            if (body == null || string.IsNullOrEmpty(body.Val?.ToString()))
             {
                 log.LogWarning("Invalid lead request body: missing required fields.");
                 return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "Body is missing required fields" });
