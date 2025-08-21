@@ -1,4 +1,5 @@
-﻿using Azure.Core;
+﻿using Azure;
+using Azure.Core;
 using Azure.Messaging.EventHubs;
 using Azure.Messaging.EventHubs.Producer;
 using Microsoft.AspNetCore.Mvc;
@@ -30,6 +31,7 @@ namespace FBAuthenticate.Controllers
         private readonly IConfiguration _config;
         private readonly TimeSpan _expiry;
         private readonly EventHubProducerClient _eventHubProducer;
+        private readonly static string RetryJobParamName = "retryJob";
 
         private static readonly ConcurrentDictionary<string, byte> _tokenKeys = new ConcurrentDictionary<string, byte>();
 
@@ -92,34 +94,6 @@ namespace FBAuthenticate.Controllers
             return await CreateJsonResponse(req, HttpStatusCode.OK, new { token });
         }
 
-
-
-        /// <summary>
-        /// Lists all active tokens from the in-memory cache.
-        /// </summary>
-        //[Function("ListTokens")]
-        //public async Task<HttpResponseData> ListTokens(
-        //    [HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequestData req,
-        //    FunctionContext context)
-        //{
-        //    var log = context.GetLogger<AuthController>();
-        //    log.LogInformation("ListTokens triggered.");
-
-        //    var result = new Dictionary<string, string>();
-
-        //    // Use the thread-safe key tracker to enumerate keys and read cached tokens
-        //    foreach (var kv in _tokenKeys)
-        //    {
-        //        var key = kv.Key;
-        //        if (_cache.TryGetValue(key, out string token))
-        //        {
-        //            result[key] = token;
-        //        }
-        //    }
-
-        //    log.LogInformation("Returning {Count} token(s).", result.Count);
-        //    return await CreateJsonResponse(req, HttpStatusCode.OK, result);
-        //}
         [Function("fbSubmitLead")]
         public async Task<HttpResponseData> fbSubmitLead(
             [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req,
@@ -134,7 +108,7 @@ namespace FBAuthenticate.Controllers
 
             // Parse query parameters
             var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-            string? retryJobValue = query[retryJobParamName];
+            string? retryJobValue = query[RetryJobParamName];
             bool isDatabricksRetry = !string.IsNullOrEmpty(retryJobValue) &&
                                    retryJobValue.ToLowerInvariant() == "true";
 
@@ -180,19 +154,6 @@ namespace FBAuthenticate.Controllers
             // Parse the request body
             dynamic? body = await ParseRequest<dynamic>(req, log, "Invalid lead request JSON");
 
-            if (isDatabricksRetry && body != null)
-            {
-                log.LogInformation("Databricks retry job detected – removing Id from lead request.");
-                body.Id = null;
-            }
-            
-            // Validate required fields
-            if (body == null || string.IsNullOrEmpty(body.Val?.ToString()))
-            {
-                log.LogWarning("Invalid lead request body: missing required fields.");
-                return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new { message = "Body is missing required fields" });
-            }
-
             // Prepare JSON and XML forms
             string jsonRequestBody = JsonConvert.SerializeObject(body);
             string xmlRequestBody = ConvertJsonToXml(jsonRequestBody);
@@ -202,12 +163,12 @@ namespace FBAuthenticate.Controllers
             bool isSuccess = false;
             string deliver_response_msg_and_status_code = "";
             string leadApiResponse = "";
-            HttpStatusCode apiStatusCode = HttpStatusCode.InternalServerError;
+            HttpStatusCode apiStatusCode = HttpStatusCode.InternalServerError; //null or 200
 
             try
             {
                 // Call API
-                var apiResult = await LeadApiRequest(_config, xmlRequestBody);
+                var apiResult = await submitLeadToDelivr(_config, xmlRequestBody);
                 leadApiResponse = apiResult.Response;
                 apiStatusCode = apiResult.StatusCode;
                 
@@ -256,7 +217,7 @@ namespace FBAuthenticate.Controllers
                         log.LogError(eventHubEx, "Failed to write to Event Hub after API failure.");
                         return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
                         {
-                            message = "Unknown error from API"
+                            message = "Unknown error from API while writing the failure to eventhub with message " + eventHubEx.ToString()
                         });
                     }
                 }
@@ -265,21 +226,15 @@ namespace FBAuthenticate.Controllers
                     // Call from retry job
                     // Respond with 525 + deliver_response_msg_and_status_code (this has to go to retry table in databricks)
                     log.LogWarning("Databricks retry job failed - returning 525 with details: {Details}", deliver_response_msg_and_status_code);
-                    return await CreateJsonResponse(req, (HttpStatusCode)525, new
-                    {
-                        message = "Retry Failure",
-                        error = deliver_response_msg_and_status_code,
-                        isRetryJob = true
-                    });
+                    return await CreateJsonResponse(req, (HttpStatusCode)525, deliver_response_msg_and_status_code);
                 }
-            }
+            } // manoj - check existing function - no changes to it
         }
-
-
         private string GenerateToken(string ip, string timestamp)
         {
+            var data = $"{ip}-{timestamp}";
             using var sha256 = SHA256.Create();
-            var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes($"{ip}-{timestamp}"));
+            var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(data));
             return Convert.ToBase64String(bytes);
         }
 
@@ -340,64 +295,49 @@ namespace FBAuthenticate.Controllers
         }
 
         // Updated to return both response and status code
-        public static async Task<(string Response, HttpStatusCode StatusCode)> LeadApiRequest(IConfiguration config, string xmlData)
+        public static async Task<(string Response, HttpStatusCode StatusCode)> submitLeadToDelivr(IConfiguration config, string xmlData)
         {
-            int maxRetries = Math.Max(1, config.GetValue<int>("LeadApiMaxRetries", 3));
-            int baseDelayMs = Math.Max(100, config.GetValue<int>("LeadApiBaseDelayMs", 500));
-            int timeoutSeconds = Math.Max(5, config.GetValue<int>("LeadApiTimeoutSeconds", 30));
+            //int maxRetries = Math.Max(1, config.GetValue<int>("LeadApiMaxRetries", 1));
+            //int baseDelayMs = Math.Max(100, config.GetValue<int>("LeadApiBaseDelayMs", 500));
+            int timeoutSeconds = Math.Max(5, config.GetValue<int>("LeadApiTimeoutSeconds", 10));
 
             var authValue = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{config["LeadApiUsername"]}:{config["LeadApiPassword"]}"));
             var requestUri = config["LeadApiUrl"];
 
-            HttpStatusCode lastStatusCode = HttpStatusCode.InternalServerError;
-            string lastResponseBody = string.Empty;
-
-            for (int attempt = 1; attempt <= maxRetries; attempt++)
-            {
+            HttpStatusCode respStatusCode = HttpStatusCode.InternalServerError;
+            string responseBody = string.Empty;
+            HttpResponseMessage response = null;
                 try
                 {
                     using var client = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
                     client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", authValue);
 
                     var content = new System.Net.Http.StringContent(xmlData, Encoding.UTF8, "application/xml");
-                    var response = await client.PostAsync(requestUri, content);
+                    response = await client.PostAsync(requestUri, content);
 
-                    lastStatusCode = response.StatusCode;
-                    lastResponseBody = await response.Content.ReadAsStringAsync();
-
-                    if (response.StatusCode == HttpStatusCode.Continue) // Status code 100
-                    {
-                        return (lastResponseBody, lastStatusCode);
-                    }
-
-                    // Status code is not 100 - continue to retry logic
-                    if (attempt == maxRetries)
-                    {
-                        // Return the response and status code instead of throwing exception
-                        // Let the calling function decide what to do with non-100 status codes
-                        return (lastResponseBody, lastStatusCode);
-                    }
+                respStatusCode = response.StatusCode;
+                responseBody = await response.Content.ReadAsStringAsync();
+                return (responseBody, respStatusCode);
                 }
                 catch (TaskCanceledException)
                 {
-                    // timeout or cancellation - don't retry, let caller handle immediately
-                    throw;
-                }
+                // timeout or cancellation - don't retry, let caller handle immediately
+                responseBody = "Timeout Exception on calling Delivr API";
+                respStatusCode = HttpStatusCode.InternalServerError;
+                return (responseBody, respStatusCode);
+            }
                 catch (System.Net.Http.HttpRequestException)
                 {
-                    // network failure - don't retry, let caller handle immediately
-                    throw;
-                }
-
-                // Exponential backoff with jitter
-                int delayMs = (int)(baseDelayMs * Math.Pow(2, attempt - 1));
-                int jitter = Random.Shared.Next(0, baseDelayMs);
-                await Task.Delay(delayMs + jitter);
+                    responseBody = "HttpRequest Exception on calling Delivr API";
+                    if (response != null && response.StatusCode != null)
+                    {
+                        respStatusCode = response.StatusCode;
+                    } else
+                    {
+                        respStatusCode = HttpStatusCode.InternalServerError;
+                    }
+                    return (responseBody, respStatusCode);
             }
-
-            // Return the last response and status code instead of throwing exception
-            // This handles the case where all retries failed due to non-100 status codes
-            return (lastResponseBody, lastStatusCode);
         }
 
         private async Task SendToEventHubAsync(string jsonBody, ILogger log)
@@ -456,6 +396,7 @@ namespace FBAuthenticate.Controllers
             response.Headers.Add("Content-Type", "application/json");
             await response.WriteStringAsync(JsonConvert.SerializeObject(obj));
             return response;
+            //manoj - only status code and message to be there in response
         }
     }
 
